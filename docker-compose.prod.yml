@@ -1,0 +1,60 @@
+version: "3.9"
+
+# Production compose — image pulled from registry (not built here)
+# Usage:
+#   IMAGE_TAG=v1.2.3 docker compose -f docker-compose.prod.yml up -d
+
+services:
+  app:
+    image: ${DOCKER_IMAGE}:${IMAGE_TAG:-latest}
+    container_name: springboot-app-prod
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      DB_URL: ${DB_URL}
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: always
+    networks:
+      - prod-network
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  db:
+    image: postgres:16-alpine
+    container_name: springboot-db-prod
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-appdb}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres-prod-data:/var/lib/postgresql/data
+    networks:
+      - prod-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${POSTGRES_DB:-appdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+volumes:
+  postgres-prod-data:
+    external: true          # pre-created on the prod host: docker volume create postgres-prod-data
+
+networks:
+  prod-network:
+    driver: bridge
