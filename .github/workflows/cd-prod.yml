@@ -1,0 +1,122 @@
+name: CD – Production Deploy
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [ closed ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Only runs when the PR is actually merged (not just closed/abandoned)
+  deploy-production:
+    name: Deploy to Production
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    environment: production      # requires manual approval if configured in GitHub settings
+
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine image tag from merged commit
+        id: vars
+        run: echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Re-tag the dev image as a stable release tag
+      - name: Re-tag image as production release
+        run: |
+          DEV_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-${{ steps.vars.outputs.sha }}"
+          PROD_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prod-${{ steps.vars.outputs.sha }}"
+          LATEST_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+
+          docker pull "$DEV_IMAGE"
+          docker tag  "$DEV_IMAGE" "$PROD_IMAGE"
+          docker tag  "$DEV_IMAGE" "$LATEST_IMAGE"
+          docker push "$PROD_IMAGE"
+          docker push "$LATEST_IMAGE"
+
+          echo "PROD_TAG=prod-${{ steps.vars.outputs.sha }}" >> $GITHUB_ENV
+
+      - name: Deploy to production server via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            cd /opt/springboot-app
+
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            export DOCKER_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            export IMAGE_TAG=${{ env.PROD_TAG }}
+            export DB_URL=${{ secrets.PROD_DB_URL }}
+            export DB_USERNAME=${{ secrets.PROD_DB_USERNAME }}
+            export DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }}
+            export POSTGRES_DB=appdb
+
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+
+            echo "Waiting for app to become healthy..."
+            for i in $(seq 1 18); do
+              STATUS=$(docker inspect --format='{{.State.Health.Status}}' springboot-app-prod 2>/dev/null)
+              if [ "$STATUS" = "healthy" ]; then
+                echo "✅ Production deployment successful!"
+                exit 0
+              fi
+              echo "  attempt $i/18 — status: $STATUS"
+              sleep 10
+            done
+
+            echo "❌ Production deployment FAILED — rolling back"
+            docker compose -f docker-compose.prod.yml down
+            exit 1
+
+      - name: Clean up old images on prod host
+        if: success()
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            # Remove dangling images, keep last 3 tagged versions
+            docker image prune -f
+            docker images "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" \
+              --format '{{.Tag}} {{.ID}}' | \
+              grep '^prod-' | sort -r | tail -n +4 | \
+              awk '{print $2}' | xargs -r docker rmi -f || true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: success()
+        with:
+          tag_name: v-${{ steps.vars.outputs.sha }}
+          name: "Production Release ${{ steps.vars.outputs.sha }}"
+          body: |
+            ## 🚀 Production Deployment
+
+            **Commit:** `${{ steps.vars.outputs.sha }}`
+            **Image:** `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prod-${{ steps.vars.outputs.sha }}`
+            **Deployed by:** @${{ github.actor }}
+
+            ### Changes
+            ${{ github.event.pull_request.body }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

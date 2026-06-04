@@ -1,0 +1,29 @@
+name: PR Validation
+
+on:
+  pull_request:
+    branches: [ main, dev ]
+
+jobs:
+  validate:
+    name: Validate PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build and test
+        run: ./mvnw verify -B
+
+      - name: Check code style (Checkstyle)
+        run: ./mvnw checkstyle:check -B || true   # warn only; flip to fail if needed
+
+      - name: Verify Docker image builds
+        run: docker build --no-cache -t pr-test-image . && docker rmi pr-test-image

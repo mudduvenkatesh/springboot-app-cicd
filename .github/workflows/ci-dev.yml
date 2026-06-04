@@ -1,0 +1,253 @@
+name: CI – Dev Branch
+
+on:
+  push:
+    branches: [ dev ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}   # e.g. myorg/springboot-app
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # 1. Unit Tests
+  # ─────────────────────────────────────────────────────────
+  unit-test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run unit tests
+        run: ./mvnw test -B
+
+      - name: Upload unit test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: target/surefire-reports/
+
+  # ─────────────────────────────────────────────────────────
+  # 2. Build & Push Docker Image
+  # ─────────────────────────────────────────────────────────
+  build-and-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: unit-test
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      short-sha: ${{ steps.vars.outputs.sha }}
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set short SHA
+        id: vars
+        run: echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set up JDK 21 (for Maven build inside Docker)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      # Cache Maven local repo so Dockerfile builder layer is warm
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=dev-${{ steps.vars.outputs.sha }}
+            type=raw,value=dev-latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────────────────────
+  # 3. Deploy to Staging Docker & Run Integration Tests
+  # ─────────────────────────────────────────────────────────
+  integration-test:
+    name: Integration Tests (Staging)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: appdb
+          POSTGRES_USER: appuser
+          POSTGRES_PASSWORD: testpassword
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run integration tests (Failsafe + Testcontainers)
+        run: ./mvnw verify -B -Pfailsafe
+        env:
+          SPRING_PROFILES_ACTIVE: prod
+          DB_URL: jdbc:postgresql://localhost:5432/appdb
+          DB_USERNAME: appuser
+          DB_PASSWORD: testpassword
+
+      - name: Upload integration test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: target/failsafe-reports/
+
+      - name: Upload JaCoCo coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/site/jacoco/
+
+  # ─────────────────────────────────────────────────────────
+  # 4. Deploy to Staging Container (self-hosted or SSH)
+  # ─────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [ build-and-push, integration-test ]
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to staging server via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            cd /opt/springboot-app
+
+            # Pull latest image
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            export DOCKER_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            export IMAGE_TAG=dev-${{ needs.build-and-push.outputs.short-sha }}
+            export DB_URL=${{ secrets.STAGING_DB_URL }}
+            export DB_USERNAME=${{ secrets.STAGING_DB_USERNAME }}
+            export DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }}
+
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+
+            # Wait for health check
+            echo "Waiting for app to become healthy..."
+            for i in $(seq 1 12); do
+              STATUS=$(docker inspect --format='{{.State.Health.Status}}' springboot-app-prod 2>/dev/null)
+              if [ "$STATUS" = "healthy" ]; then
+                echo "✅ App is healthy!"
+                exit 0
+              fi
+              echo "  attempt $i/12 — status: $STATUS"
+              sleep 10
+            done
+            echo "❌ App did not become healthy in time"
+            exit 1
+
+  # ─────────────────────────────────────────────────────────
+  # 5. Automatically Create Pull Request: dev → main
+  # ─────────────────────────────────────────────────────────
+  create-pr:
+    name: Create PR to main
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create Pull Request dev → main
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: main
+          branch: dev
+          title: "🚀 Release: dev → main (${{ needs.build-and-push.outputs.short-sha }})"
+          body: |
+            ## Automated Release PR
+
+            | Field | Value |
+            |-------|-------|
+            | **Commit** | `${{ needs.build-and-push.outputs.short-sha }}` |
+            | **Image** | `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-${{ needs.build-and-push.outputs.short-sha }}` |
+            | **Branch** | `dev` → `main` |
+
+            ### ✅ Checks Passed
+            - [x] Unit tests
+            - [x] Docker image built & pushed to GHCR
+            - [x] Integration tests (Testcontainers + PostgreSQL)
+            - [x] Staging deployment healthy
+
+            ### 📋 Review Checklist
+            - [ ] Code reviewed
+            - [ ] No regressions in staging
+            - [ ] Ready for production
+
+            > Merge this PR to trigger automatic production deployment.
+          labels: |
+            automated
+            release
+          draft: false
